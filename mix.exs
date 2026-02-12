@@ -66,7 +66,7 @@ defmodule Req.MixProject do
       {:plug, "~> 1.0", [optional: true] ++ plug_opts()},
       {:brotli, "~> 0.3.1", optional: true},
       {:ezstd, "~> 1.0", optional: true},
-      {:ether, github: "bright-org/ether", branch: "develop", app: false},
+      {:ether, github: "bright-org/ether", branch: "feature/ex_tcp-loop-and-tcp-state", app: false},
       {:ex_tcp, path: "deps/ether/ex_tcp"},
       {:aws_signature, "~> 0.3.2", only: :test},
       {:bypass, "~> 2.1", only: :test},
