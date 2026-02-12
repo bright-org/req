@@ -1099,7 +1099,7 @@ defmodule Req do
     port = req.url.port || default_port(req.url.scheme)
 
     with {:ok, dst_ip} <- resolve_host(host),
-         {:ok, sock, seq, ack, flow} <- ExTCP.connect_raw(dst_ip, port) do
+         {:ok, sock, seq, ack, flow} <- ExTCP.connect(dst_ip, port) do
       request_packet = build_http_request(req)
       {src_ip, _src_port, dst_ip, _dst_port} = flow
       src_port = elem(flow, 1)
