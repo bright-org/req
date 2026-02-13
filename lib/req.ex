@@ -1096,28 +1096,43 @@ defmodule Req do
   def request(request, options \\ []) do
     req = new(request, options)
     host = req.url.host || "localhost"
-    port = req.url.port || default_port(req.url.scheme)
+    port = req.url.port || ExTCP.default_port(req.url.scheme)
 
-    with {:ok, dst_ip} <- resolve_host(host),
+    with {:ok, dst_ip} <- ExTCP.resolve_host(host),
          {:ok, sock, seq, ack, flow} <- ExTCP.connect(dst_ip, port) do
-      request_packet = build_http_request(req)
-      {src_ip, _src_port, dst_ip, _dst_port} = flow
-      src_port = elem(flow, 1)
-      dst_port = elem(flow, 3)
-
-      ExTCP.send_psh_ack(sock, src_ip, src_port, dst_ip, dst_port, seq, ack, request_packet)
-      seq_after = seq + byte_size(request_packet)
+      request_packet =
+        ExTCP.build_http_request(
+          req.method,
+          req.url.path,
+          req.url.query,
+          req.url.host,
+          req.url.port,
+          req.url.scheme,
+          Req.Fields.get_list(req.headers),
+          req.body || ""
+        )
+      {src_ip, src_port, dst_ip, dst_port} = flow
+      seq_after = send(sock, src_ip, src_port, dst_ip, dst_port, seq, ack, request_packet)
       deadline = System.monotonic_time(:millisecond) + 30_000
 
       case ExTCP.wait_segment(sock, 0x10, flow, deadline) do
         {:ok, ack_pkt} ->
-          {final_ack, response_binary} = ExTCP.receive_all_response_packets(sock, flow, deadline, seq_after, ack_pkt.seq)
-          ExTCP.close_connection(sock, src_ip, src_port, dst_ip, dst_port, seq_after, final_ack, flow)
+          initial_state = %ExTCP.TcpState{
+            socket: sock,
+            phase: :status,
+            buffer: <<>>,
+            parse_fn: &parse/1,
+            body: nil
+          }
 
-          case parse_response_buffer(response_binary) do
-            %{status: status, headers: headers, body: body} when is_integer(status) ->
+          case ExTCP.handle_receive(sock, flow, deadline, seq_after, ack_pkt.seq, initial_state) do
+            {:ok, %{status: status, headers: headers, body: body} = _parsed, final_ack}
+            when is_integer(status) ->
+              ExTCP.close_connection(sock, src_ip, src_port, dst_ip, dst_port, seq_after, final_ack, flow)
               {:ok, Req.Response.new(status: status, headers: headers, body: body)}
-            _ ->
+
+            {:ok, _parsed, final_ack} ->
+              ExTCP.close_connection(sock, src_ip, src_port, dst_ip, dst_port, seq_after, final_ack, flow)
               {:error, %Req.TransportError{reason: :invalid_response}}
           end
 
@@ -1131,33 +1146,9 @@ defmodule Req do
     end
   end
 
-  defp default_port("https"), do: 443
-  defp default_port(_), do: 80
-
-  defp resolve_host(host) when is_binary(host), do: resolve_host(String.to_charlist(host))
-  defp resolve_host(host) when is_list(host) do
-    case :inet.getaddr(host, :inet) do
-      {:ok, {a, b, c, d}} -> {:ok, {a, b, c, d}}
-      {:error, _} -> {:error, :nxdomain}
-    end
-  end
-
-  defp build_http_request(req) do
-    path = req.url.path || "/"
-    path_and_query = if req.url.query, do: path <> "?" <> req.url.query, else: path
-    method_str = req.method |> to_string() |> String.upcase()
-    request_line = "#{method_str} #{path_and_query} HTTP/1.1\r\n"
-    port_suffix = if req.url.port && req.url.port != default_port(req.url.scheme), do: ":" <> to_string(req.url.port), else: ""
-    host_header = "Host: #{req.url.host}#{port_suffix}\r\n"
-    headers_str =
-      req.headers
-      |> Req.Fields.get_list()
-      |> Enum.map(fn {k, v} -> "#{k}: #{v}\r\n" end)
-      |> Enum.join()
-    body = req.body || ""
-    body = if is_binary(body), do: body, else: IO.iodata_to_binary(body)
-    packet = [request_line, host_header, headers_str, "\r\n", body]
-    IO.iodata_to_binary(packet)
+  defp send(sock, src_ip, src_port, dst_ip, dst_port, seq, ack, request_packet) do
+    ExTCP.send_psh_ack(sock, src_ip, src_port, dst_ip, dst_port, seq, ack, request_packet)
+    seq + byte_size(request_packet)
   end
 
   defp parse_response_buffer(buffer) do
@@ -1200,18 +1191,15 @@ defmodule Req do
         <<body::binary-size(content_length), rest::binary>> = buf
         %{state | buffer: rest, phase: :done, body: Map.put(state.body, :body, body)}
       content_length == nil and byte_size(buf) > 0 ->
-        # No Content-Length (e.g. HTTP/1.0 close): treat remainder as body
         %{state | buffer: "", phase: :done, body: Map.put(state.body, :body, buf)}
       content_length != nil and byte_size(buf) < content_length ->
-        # 受信が Content-Length に満たない場合でも終了する（切り詰め/空 body で :done）。無限ループを防ぐ。
-        %{state | buffer: "", phase: :done, body: Map.put(state.body, :body, buf)}
+        state
       true ->
         state
     end
   end
 
   defp parse_status_code(<<"HTTP/1.", _::binary>> = line) do
-    # "HTTP/1.1 200 OK" or "HTTP/1.0 404 Not Found" — 理由句を含むので先頭の数値だけパース
     case String.split(line, " ", parts: 2) do
       [_, rest] ->
         case Integer.parse(rest) do
