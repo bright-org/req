@@ -1100,32 +1100,21 @@ defmodule Req do
 
     with {:ok, dst_ip} <- ExTCP.resolve_host(host),
          {:ok, sock, seq, ack, flow} <- ExTCP.connect(dst_ip, port) do
-      request_packet =
-        ExTCP.build_http_request(
-          req.method,
-          req.url.path,
-          req.url.query,
-          req.url.host,
-          req.url.port,
-          req.url.scheme,
-          Req.Fields.get_list(req.headers),
-          req.body || ""
-        )
       {src_ip, src_port, dst_ip, dst_port} = flow
-      seq_after = send(sock, src_ip, src_port, dst_ip, dst_port, seq, ack, request_packet)
+      seq_after = send_get(sock, src_ip, src_port, dst_ip, dst_port, seq, ack, req)
       deadline = System.monotonic_time(:millisecond) + 30_000
 
       case ExTCP.wait_segment(sock, 0x10, flow, deadline) do
         {:ok, ack_pkt} ->
-          initial_state = %ExTCP.TcpState{
+          initial_state = %ExTCP.StreamParseState{
             socket: sock,
             phase: :status,
             buffer: <<>>,
-            parse_fn: &parse/1,
+            parse_fn: &parse_get_cont/1,
             body: nil
           }
 
-          case ExTCP.handle_receive(sock, flow, deadline, seq_after, ack_pkt.seq, initial_state) do
+          case ExTCP.handle_receive(flow, deadline, seq_after, ack_pkt.seq, initial_state) do
             {:ok, %{status: status, headers: headers, body: body} = _parsed, final_ack}
             when is_integer(status) ->
               ExTCP.close_connection(sock, src_ip, src_port, dst_ip, dst_port, seq_after, final_ack, flow)
@@ -1146,43 +1135,60 @@ defmodule Req do
     end
   end
 
-  defp send(sock, src_ip, src_port, dst_ip, dst_port, seq, ack, request_packet) do
+  defp send_get(sock, src_ip, src_port, dst_ip, dst_port, seq, ack, req) do
+    path = req.url.path || "/"
+    path_and_query = if req.url.query, do: path <> "?" <> req.url.query, else: path
+    method_str = req.method |> to_string() |> String.upcase()
+    request_line = "#{method_str} #{path_and_query} HTTP/1.1\r\n"
+    scheme = req.url.scheme
+    actual_port = req.url.port || ExTCP.default_port(scheme)
+    port_suffix = if actual_port != ExTCP.default_port(scheme), do: ":" <> to_string(actual_port), else: ""
+    host_header = "Host: #{req.url.host}#{port_suffix}\r\n"
+    headers_list = Req.Fields.get_list(req.headers)
+    headers_str =
+      headers_list
+      |> Enum.map(fn {k, v} -> "#{k}: #{v}\r\n" end)
+      |> Enum.join()
+    body = req.body || ""
+    body_bin = if is_binary(body), do: body, else: IO.iodata_to_binary(body)
+    packet = [request_line, host_header, headers_str, "\r\n", body_bin]
+    request_packet = IO.iodata_to_binary(packet)
+
     ExTCP.send_psh_ack(sock, src_ip, src_port, dst_ip, dst_port, seq, ack, request_packet)
     seq + byte_size(request_packet)
   end
 
-  defp parse_response_buffer(buffer) do
-    state = %{buffer: buffer, phase: :status, body: nil}
-    parse_until_done(state)
+  # ExTCP.handle_receive 用。parse_fn の契約 {:done, body} | {:cont, state} に合わせる。
+  defp parse_get_cont(state) do
+    case parse_get(state) do
+      %{phase: :done, body: body} -> {:done, body}
+      s -> {:cont, s}
+    end
   end
 
-  defp parse_until_done(%{phase: :done, body: body}), do: body
-  defp parse_until_done(%{phase: :status, buffer: "", body: nil}), do: nil
-  defp parse_until_done(state), do: state |> parse() |> parse_until_done()
-
-  def parse(%{phase: :status} = state) do
+  def parse_get(%{phase: :status} = state) do
     case :binary.split(state.buffer, "\r\n") do
       [status_line, rest] ->
         code = parse_status_code(status_line)
-        parse(%{state | buffer: rest, phase: :headers, body: %{status: code}})
+        parse_get(%{state | buffer: rest, phase: :headers, body: %{status: code}})
 
       [_] ->
         state
     end
   end
 
-  def parse(%{phase: :headers} = state) do
+  def parse_get(%{phase: :headers} = state) do
     case :binary.split(state.buffer, "\r\n\r\n") do
       [headers_part, rest] ->
         headers = parse_headers(headers_part)
-        parse(%{state | buffer: rest, phase: :body, body: Map.put(state.body || %{}, :headers, headers)})
+        parse_get(%{state | buffer: rest, phase: :body, body: Map.put(state.body || %{}, :headers, headers)})
 
       [_] ->
         state
     end
   end
 
-  def parse(%{phase: :body} = state) do
+  def parse_get(%{phase: :body} = state) do
     content_length = get_content_length(state.body[:headers])
     buf = state.buffer
 
