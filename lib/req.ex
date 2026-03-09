@@ -154,6 +154,9 @@ defmodule Req do
   @req Req.Request.new()
        |> Req.Steps.attach()
 
+  # ExTCP 経路で許可する HTTP メソッド（get/post/put/delete が method をセットして request を呼ぶ前提）
+  @supported_methods [:get, :post, :put, :delete]
+
   @default_finch_options Req.Finch.pool_options(%{})
 
   @doc """
@@ -1095,13 +1098,22 @@ defmodule Req do
           {:ok, Req.Response.t()} | {:error, Exception.t()}
   def request(request, options \\ []) do
     req = new(request, options)
+
+    if req.method in @supported_methods do
+      do_request(req)
+    else
+      {:error, %Req.TransportError{reason: {:unsupported_method, req.method}}}
+    end
+  end
+
+  defp do_request(req) do
     host = req.url.host || "localhost"
     port = req.url.port || ExTCP.default_port(req.url.scheme)
 
     with {:ok, dst_ip} <- ExTCP.resolve_host(host),
          {:ok, sock, seq, ack, flow} <- ExTCP.connect(dst_ip, port) do
       {src_ip, src_port, dst_ip, dst_port} = flow
-      seq_after = send_get(sock, src_ip, src_port, dst_ip, dst_port, seq, ack, req)
+      seq_after = send_request(sock, src_ip, src_port, dst_ip, dst_port, seq, ack, req)
       deadline = System.monotonic_time(:millisecond) + 30_000
 
       case ExTCP.wait_segment(sock, 0x10, flow, deadline) do
@@ -1110,7 +1122,7 @@ defmodule Req do
             socket: sock,
             phase: :status,
             buffer: <<>>,
-            parse_fn: &parse_get_cont/1,
+            parse_fn: &parse_http_response_cont/1,
             body: nil
           }
 
@@ -1135,7 +1147,11 @@ defmodule Req do
     end
   end
 
-  defp send_get(sock, src_ip, src_port, dst_ip, dst_port, seq, ack, req) do
+  defp has_content_length?(headers_list) do
+    Enum.any?(headers_list, fn {k, _} -> String.downcase(k) == "content-length" end)
+  end
+
+  defp send_request(sock, src_ip, src_port, dst_ip, dst_port, seq, ack, req) do
     path = req.url.path || "/"
     path_and_query = if req.url.query, do: path <> "?" <> req.url.query, else: path
     method_str = req.method |> to_string() |> String.upcase()
@@ -1144,13 +1160,23 @@ defmodule Req do
     actual_port = req.url.port || ExTCP.default_port(scheme)
     port_suffix = if actual_port != ExTCP.default_port(scheme), do: ":" <> to_string(actual_port), else: ""
     host_header = "Host: #{req.url.host}#{port_suffix}\r\n"
+
+    body = req.body || ""
+    body_bin = if is_binary(body), do: body, else: IO.iodata_to_binary(body)
+
     headers_list = Req.Fields.get_list(req.headers)
+    headers_list =
+      if body_bin != "" and not has_content_length?(headers_list) do
+        [{"content-length", Integer.to_string(byte_size(body_bin))} | headers_list]
+      else
+        headers_list
+      end
+
     headers_str =
       headers_list
       |> Enum.map(fn {k, v} -> "#{k}: #{v}\r\n" end)
       |> Enum.join()
-    body = req.body || ""
-    body_bin = if is_binary(body), do: body, else: IO.iodata_to_binary(body)
+
     packet = [request_line, host_header, headers_str, "\r\n", body_bin]
     request_packet = IO.iodata_to_binary(packet)
 
@@ -1159,36 +1185,36 @@ defmodule Req do
   end
 
   # ExTCP.handle_receive 用。parse_fn の契約 {:done, body} | {:cont, state} に合わせる。
-  defp parse_get_cont(state) do
-    case parse_get(state) do
+  defp parse_http_response_cont(state) do
+    case parse_http_response(state) do
       %{phase: :done, body: body} -> {:done, body}
       s -> {:cont, s}
     end
   end
 
-  def parse_get(%{phase: :status} = state) do
+  def parse_http_response(%{phase: :status} = state) do
     case :binary.split(state.buffer, "\r\n") do
       [status_line, rest] ->
         code = parse_status_code(status_line)
-        parse_get(%{state | buffer: rest, phase: :headers, body: %{status: code}})
+        parse_http_response(%{state | buffer: rest, phase: :headers, body: %{status: code}})
 
       [_] ->
         state
     end
   end
 
-  def parse_get(%{phase: :headers} = state) do
+  def parse_http_response(%{phase: :headers} = state) do
     case :binary.split(state.buffer, "\r\n\r\n") do
       [headers_part, rest] ->
         headers = parse_headers(headers_part)
-        parse_get(%{state | buffer: rest, phase: :body, body: Map.put(state.body || %{}, :headers, headers)})
+        parse_http_response(%{state | buffer: rest, phase: :body, body: Map.put(state.body || %{}, :headers, headers)})
 
       [_] ->
         state
     end
   end
 
-  def parse_get(%{phase: :body} = state) do
+  def parse_http_response(%{phase: :body} = state) do
     content_length = get_content_length(state.body[:headers])
     buf = state.buffer
 
