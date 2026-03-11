@@ -154,6 +154,9 @@ defmodule Req do
   @req Req.Request.new()
        |> Req.Steps.attach()
 
+  # ExTCP 経路で許可する HTTP メソッド（get/post/put/delete が method をセットして request を呼ぶ前提）
+  @supported_methods [:get, :post, :put, :delete]
+
   @default_finch_options Req.Finch.pool_options(%{})
 
   @doc """
@@ -1095,82 +1098,140 @@ defmodule Req do
           {:ok, Req.Response.t()} | {:error, Exception.t()}
   def request(request, options \\ []) do
     req = new(request, options)
-    host = req.url.host || "localhost"
-    port = req.url.port || default_port(req.url.scheme)
 
-    case ExTCP.connect_stream(host, port) do
-      {:ok, sock} ->
-        send_http_request(sock, req)
-        case ExTCP.loop(%ExTCP.TcpState{socket: sock, phase: :status, parse_fn: &parse/1}) do
-          {:ok, %{status: status, headers: headers, body: body}} ->
-            {:ok, Req.Response.new(status: status, headers: headers, body: body)}
-          {:ok, _} ->
-            {:error, %Req.TransportError{reason: :invalid_response}}
-          {:error, reason} ->
-            {:error, %Req.TransportError{reason: reason}}
-        end
+    if req.method in @supported_methods do
+      do_request(req)
+    else
+      {:error, %Req.TransportError{reason: {:unsupported_method, req.method}}}
+    end
+  end
+
+  defp do_request(req) do
+    host = req.url.host || "localhost"
+    port = req.url.port || ExTCP.default_port(req.url.scheme)
+
+    with {:ok, dst_ip} <- ExTCP.resolve_host(host),
+         {:ok, sock, seq, ack, flow} <- ExTCP.connect(dst_ip, port) do
+      {src_ip, src_port, dst_ip, dst_port} = flow
+      seq_after = send_request(sock, src_ip, src_port, dst_ip, dst_port, seq, ack, req)
+      deadline = System.monotonic_time(:millisecond) + 30_000
+
+      case ExTCP.wait_segment(sock, 0x10, flow, deadline) do
+        {:ok, ack_pkt} ->
+          initial_state = %ExTCP.StreamParseState{
+            socket: sock,
+            phase: :status,
+            buffer: <<>>,
+            parse_fn: &parse_http_response_cont/1,
+            body: nil
+          }
+
+          case ExTCP.handle_receive(flow, deadline, seq_after, ack_pkt.seq, initial_state) do
+            {:ok, %{status: status, headers: headers, body: body} = _parsed, final_ack}
+            when is_integer(status) ->
+              ExTCP.close_connection(sock, src_ip, src_port, dst_ip, dst_port, seq_after, final_ack, flow)
+              {:ok, Req.Response.new(status: status, headers: headers, body: body)}
+
+            {:ok, _parsed, final_ack} ->
+              ExTCP.close_connection(sock, src_ip, src_port, dst_ip, dst_port, seq_after, final_ack, flow)
+              {:error, %Req.TransportError{reason: :invalid_response}}
+          end
+
+        {:error, reason} ->
+          :socket.close(sock)
+          {:error, %Req.TransportError{reason: reason}}
+      end
+    else
       {:error, reason} ->
         {:error, %Req.TransportError{reason: reason}}
     end
   end
 
-  defp default_port("https"), do: 443
-  defp default_port(_), do: 80
+  defp has_content_length?(headers_list) do
+    Enum.any?(headers_list, fn {k, _} -> String.downcase(k) == "content-length" end)
+  end
 
-  defp send_http_request(sock, req) do
+  defp send_request(sock, src_ip, src_port, dst_ip, dst_port, seq, ack, req) do
     path = req.url.path || "/"
     path_and_query = if req.url.query, do: path <> "?" <> req.url.query, else: path
     method_str = req.method |> to_string() |> String.upcase()
     request_line = "#{method_str} #{path_and_query} HTTP/1.1\r\n"
-    port_suffix = if req.url.port && req.url.port != default_port(req.url.scheme), do: ":" <> to_string(req.url.port), else: ""
+    scheme = req.url.scheme
+    actual_port = req.url.port || ExTCP.default_port(scheme)
+    port_suffix = if actual_port != ExTCP.default_port(scheme), do: ":" <> to_string(actual_port), else: ""
     host_header = "Host: #{req.url.host}#{port_suffix}\r\n"
+
+    body = req.body || ""
+    body_bin = if is_binary(body), do: body, else: IO.iodata_to_binary(body)
+
+    headers_list = Req.Fields.get_list(req.headers)
+    headers_list =
+      if body_bin != "" and not has_content_length?(headers_list) do
+        [{"content-length", Integer.to_string(byte_size(body_bin))} | headers_list]
+      else
+        headers_list
+      end
+
     headers_str =
-      req.headers
-      |> Req.Fields.get_list()
+      headers_list
       |> Enum.map(fn {k, v} -> "#{k}: #{v}\r\n" end)
       |> Enum.join()
-    body = req.body || ""
-    body = if is_binary(body), do: body, else: IO.iodata_to_binary(body)
-    packet = [request_line, host_header, headers_str, "\r\n", body]
-    :gen_tcp.send(sock, packet)
+
+    packet = [request_line, host_header, headers_str, "\r\n", body_bin]
+    request_packet = IO.iodata_to_binary(packet)
+
+    ExTCP.send_psh_ack(sock, src_ip, src_port, dst_ip, dst_port, seq, ack, request_packet)
+    seq + byte_size(request_packet)
   end
 
-  def parse(%{phase: :status} = state) do
+  # ExTCP.handle_receive 用。parse_fn の契約 {:done, body} | {:cont, state} に合わせる。
+  defp parse_http_response_cont(state) do
+    case parse_http_response(state) do
+      %{phase: :done, body: body} -> {:done, body}
+      s -> {:cont, s}
+    end
+  end
+
+  def parse_http_response(%{phase: :status} = state) do
     case :binary.split(state.buffer, "\r\n") do
       [status_line, rest] ->
         code = parse_status_code(status_line)
-        parse(%{state | buffer: rest, phase: :headers, body: %{status: code}})
+        parse_http_response(%{state | buffer: rest, phase: :headers, body: %{status: code}})
 
       [_] ->
         state
     end
   end
 
-  def parse(%{phase: :headers} = state) do
+  def parse_http_response(%{phase: :headers} = state) do
     case :binary.split(state.buffer, "\r\n\r\n") do
       [headers_part, rest] ->
         headers = parse_headers(headers_part)
-        parse(%{state | buffer: rest, phase: :body, body: Map.put(state.body || %{}, :headers, headers)})
+        parse_http_response(%{state | buffer: rest, phase: :body, body: Map.put(state.body || %{}, :headers, headers)})
 
       [_] ->
         state
     end
   end
 
-  def parse(%{phase: :body} = state) do
+  def parse_http_response(%{phase: :body} = state) do
     content_length = get_content_length(state.body[:headers])
     buf = state.buffer
 
-    if content_length != nil and byte_size(buf) >= content_length do
-      <<body::binary-size(content_length), rest::binary>> = buf
-      %{state | buffer: rest, phase: :done, body: Map.put(state.body, :body, body)}
-    else
-      state
+    cond do
+      content_length != nil and byte_size(buf) >= content_length ->
+        <<body::binary-size(content_length), rest::binary>> = buf
+        %{state | buffer: rest, phase: :done, body: Map.put(state.body, :body, body)}
+      content_length == nil and byte_size(buf) > 0 ->
+        %{state | buffer: "", phase: :done, body: Map.put(state.body, :body, buf)}
+      content_length != nil and byte_size(buf) < content_length ->
+        state
+      true ->
+        state
     end
   end
 
   defp parse_status_code(<<"HTTP/1.", _::binary>> = line) do
-    # "HTTP/1.1 200 OK" or "HTTP/1.0 404 Not Found" — 理由句を含むので先頭の数値だけパース
     case String.split(line, " ", parts: 2) do
       [_, rest] ->
         case Integer.parse(rest) do
