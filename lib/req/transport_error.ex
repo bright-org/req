@@ -11,6 +11,10 @@ defmodule Req.TransportError do
   defexception [:reason]
 
   @impl true
+  def message(%__MODULE__{reason: {:ex_tcp, detail}}) do
+    "ex_tcp: " <> IO.chardata_to_string(detail)
+  end
+
   def message(%__MODULE__{reason: reason}) do
     Mint.TransportError.message(%Mint.TransportError{reason: reason})
   end
