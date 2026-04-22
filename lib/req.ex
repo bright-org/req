@@ -1135,6 +1135,10 @@ defmodule Req do
             {:ok, _parsed, final_ack} ->
               ExTCP.close_connection(sock, src_ip, src_port, dst_ip, dst_port, seq_after, final_ack, flow)
               {:error, %Req.TransportError{reason: :invalid_response}}
+
+            {:error, reason, _server_seq} ->
+              :socket.close(sock)
+              {:error, %Req.TransportError{reason: {:ex_tcp, reason}}}
           end
 
         {:error, reason} ->
@@ -1217,13 +1221,16 @@ defmodule Req do
   def parse_http_response(%{phase: :body} = state) do
     content_length = get_content_length(state.body[:headers])
     buf = state.buffer
+    current_body = Map.get(state.body, :body, "")
 
     cond do
       content_length != nil and byte_size(buf) >= content_length ->
         <<body::binary-size(content_length), rest::binary>> = buf
         %{state | buffer: rest, phase: :done, body: Map.put(state.body, :body, body)}
       content_length == nil and byte_size(buf) > 0 ->
-        %{state | buffer: "", phase: :done, body: Map.put(state.body, :body, buf)}
+        # Responses without Content-Length concatenate received data until FIN.
+        # Completion is determined in the FIN branch of ExTCP.handle_receive/5.
+        %{state | buffer: "", phase: :body, body: Map.put(state.body, :body, current_body <> buf)}
       content_length != nil and byte_size(buf) < content_length ->
         state
       true ->
