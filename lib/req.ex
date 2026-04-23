@@ -1115,35 +1115,27 @@ defmodule Req do
       {src_ip, src_port, dst_ip, dst_port} = flow
       seq_after = send_request(sock, src_ip, src_port, dst_ip, dst_port, seq, ack, req)
       deadline = System.monotonic_time(:millisecond) + 30_000
+      initial_state = %ExTCP.StreamParseState{
+        socket: sock,
+        phase: :status,
+        buffer: <<>>,
+        parse_fn: &parse_http_response_cont/1,
+        body: nil
+      }
 
-      case ExTCP.wait_segment(sock, 0x10, flow, deadline) do
-        {:ok, ack_pkt} ->
-          initial_state = %ExTCP.StreamParseState{
-            socket: sock,
-            phase: :status,
-            buffer: <<>>,
-            parse_fn: &parse_http_response_cont/1,
-            body: nil
-          }
+      case ExTCP.handle_receive(flow, deadline, seq_after, ack, initial_state) do
+        {:ok, %{status: status, headers: headers, body: body} = _parsed, final_ack}
+        when is_integer(status) ->
+          ExTCP.close_connection(sock, src_ip, src_port, dst_ip, dst_port, seq_after, final_ack, flow)
+          {:ok, Req.Response.new(status: status, headers: headers, body: body)}
 
-          case ExTCP.handle_receive(flow, deadline, seq_after, ack_pkt.seq, initial_state) do
-            {:ok, %{status: status, headers: headers, body: body} = _parsed, final_ack}
-            when is_integer(status) ->
-              ExTCP.close_connection(sock, src_ip, src_port, dst_ip, dst_port, seq_after, final_ack, flow)
-              {:ok, Req.Response.new(status: status, headers: headers, body: body)}
+        {:ok, _parsed, final_ack} ->
+          ExTCP.close_connection(sock, src_ip, src_port, dst_ip, dst_port, seq_after, final_ack, flow)
+          {:error, %Req.TransportError{reason: :invalid_response}}
 
-            {:ok, _parsed, final_ack} ->
-              ExTCP.close_connection(sock, src_ip, src_port, dst_ip, dst_port, seq_after, final_ack, flow)
-              {:error, %Req.TransportError{reason: :invalid_response}}
-
-            {:error, reason, _server_seq} ->
-              :socket.close(sock)
-              {:error, %Req.TransportError{reason: {:ex_tcp, reason}}}
-          end
-
-        {:error, reason} ->
+        {:error, reason, _server_seq} ->
           :socket.close(sock)
-          {:error, %Req.TransportError{reason: reason}}
+          {:error, %Req.TransportError{reason: {:ex_tcp, reason}}}
       end
     else
       {:error, reason} ->
