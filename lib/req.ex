@@ -1203,7 +1203,11 @@ defmodule Req do
     case :binary.split(state.buffer, "\r\n\r\n") do
       [headers_part, rest] ->
         headers = parse_headers(headers_part)
-        parse_http_response(%{state | buffer: rest, phase: :body, body: Map.put(state.body || %{}, :headers, headers)})
+        body_map =
+          (state.body || %{})
+          |> Map.put(:headers, headers)
+          |> Map.put_new(:body, "")
+        parse_http_response(%{state | buffer: rest, phase: :body, body: body_map})
 
       [_] ->
         state
