@@ -558,25 +558,25 @@ defmodule Req do
     request =
       Enum.reduce(request_options, request, fn
         {:url, url}, acc ->
-          put_in(acc.url, URI.parse(url))
+          %{acc | url: parse_url(url)}
 
         {:headers, new_headers}, acc ->
-          update_in(acc.headers, &Req.Fields.merge(&1, new_headers))
+          %{acc | headers: Req.Fields.merge(acc.headers, new_headers)}
 
         {name, value}, acc ->
           %{acc | name => value}
       end)
 
-    update_in(
-      request.options,
-      &Map.merge(&1, Map.new(options), fn
+    merged_options =
+      Map.merge(request.options, Map.new(options), fn
         :params, old, new ->
           Keyword.merge(old, new)
 
         _, _, new ->
           new
       end)
-    )
+
+    %{request | options: merged_options}
   end
 
   @doc """
@@ -617,7 +617,13 @@ defmodule Req do
   @doc type: :request
   @spec get(url() | keyword() | Req.Request.t(), options :: keyword()) ::
           {:ok, Req.Response.t()} | {:error, Exception.t()}
-  def get(request, options \\ []) do
+  def get(request, options \\ [])
+
+  def get(url, options) when is_binary(url) do
+    do_request(simple_request(:get, url, options))
+  end
+
+  def get(request, options) do
     request(%{new(request, options) | method: :get})
   end
 
@@ -1107,6 +1113,43 @@ defmodule Req do
   end
 
   defp do_request(req) do
+    if ex_tcp_available?() do
+      do_request_ex_tcp(req)
+    else
+      do_request_gen_tcp(req)
+    end
+  end
+
+  defp ex_tcp_available? do
+    case :erlang.get(:req_ex_tcp_available) do
+      {:ok, value} ->
+        value
+
+      _ ->
+        value =
+          try do
+            case :socket.open(:inet, :raw, :tcp) do
+              {:ok, sock} ->
+                :socket.close(sock)
+                true
+
+              _ ->
+                false
+            end
+          catch
+            :error, :badarg -> false
+            :error, :undef -> false
+          end
+
+        :erlang.put(:req_ex_tcp_available, {:ok, value})
+        value
+    end
+  catch
+    :error, :undef -> false
+    :error, :badarg -> false
+  end
+
+  defp do_request_ex_tcp(req) do
     host = req.url.host || "localhost"
     port = req.url.port || ExTCP.default_port(req.url.scheme)
 
@@ -1143,14 +1186,69 @@ defmodule Req do
     end
   end
 
+  defp do_request_gen_tcp(req) do
+    host = req.url.host || "localhost"
+    port = req.url.port || ExTCP.default_port(req.url.scheme)
+    timeout = 30_000
+
+    with {:ok, socket} <-
+           :gen_tcp.connect(
+             :erlang.binary_to_list(host),
+             port,
+             [{:timeout, timeout}, :binary, active: false]
+           ),
+         :ok <- :gen_tcp.send(socket, build_request_packet(req)),
+         {:ok, %{status: status, headers: headers, body: body}} <-
+           recv_http_response(socket, timeout) do
+      :gen_tcp.close(socket)
+      {:ok, %Req.Response{status: status, headers: headers, body: body || ""}}
+    else
+      {:error, reason} ->
+        {:error, %Req.TransportError{reason: reason}}
+    end
+  end
+
+  defp recv_http_response(socket, timeout, state \\ %{phase: :status, buffer: <<>>, body: nil}) do
+    state = parse_http_response(state)
+
+    case state do
+      %{phase: :done, body: body_map} ->
+        {:ok, body_map}
+
+      state_after ->
+        case :gen_tcp.recv(socket, 0, timeout) do
+          {:ok, data} ->
+            recv_http_response(socket, timeout, %{state_after | buffer: state_after.buffer <> data})
+
+          {:error, :closed} ->
+            case state_after do
+              %{phase: :body, body: %{status: status} = body_map} when is_integer(status) ->
+                {:ok, body_map}
+
+              _ ->
+                {:error, :closed}
+            end
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+    end
+  end
+
   defp has_content_length?(headers_list) do
-    Enum.any?(headers_list, fn {k, _} -> String.downcase(k) == "content-length" end)
+    Enum.any?(headers_list, fn {k, _} -> ascii_downcase(k) == "content-length" end)
   end
 
   defp send_request(sock, src_ip, src_port, dst_ip, dst_port, seq, ack, req) do
+    request_packet = build_request_packet(req)
+    ExTCP.send_psh_ack(sock, src_ip, src_port, dst_ip, dst_port, seq, ack, request_packet)
+    seq + byte_size(request_packet)
+  end
+
+  defp build_request_packet(req) do
     path = req.url.path || "/"
     path_and_query = if req.url.query, do: path <> "?" <> req.url.query, else: path
-    method_str = req.method |> to_string() |> String.upcase()
+    method_str = http_method_name(req.method)
     request_line = "#{method_str} #{path_and_query} HTTP/1.1\r\n"
     scheme = req.url.scheme
     actual_port = req.url.port || ExTCP.default_port(scheme)
@@ -1173,11 +1271,8 @@ defmodule Req do
       |> Enum.map(fn {k, v} -> "#{k}: #{v}\r\n" end)
       |> Enum.join()
 
-    packet = [request_line, host_header, headers_str, "\r\n", body_bin]
-    request_packet = IO.iodata_to_binary(packet)
-
-    ExTCP.send_psh_ack(sock, src_ip, src_port, dst_ip, dst_port, seq, ack, request_packet)
-    seq + byte_size(request_packet)
+    [request_line, host_header, headers_str, "\r\n", body_bin]
+    |> IO.iodata_to_binary()
   end
 
   # ExTCP.handle_receive 用。parse_fn の契約 {:done, body} | {:cont, state} に合わせる。
@@ -1187,6 +1282,12 @@ defmodule Req do
       s -> {:cont, s}
     end
   end
+
+  defp http_method_name(:get), do: "GET"
+  defp http_method_name(:post), do: "POST"
+  defp http_method_name(:put), do: "PUT"
+  defp http_method_name(:delete), do: "DELETE"
+  defp http_method_name(method), do: method |> to_string() |> ascii_upcase()
 
   def parse_http_response(%{phase: :status} = state) do
     case :binary.split(state.buffer, "\r\n") do
@@ -1206,7 +1307,7 @@ defmodule Req do
         body_map =
           (state.body || %{})
           |> Map.put(:headers, headers)
-          |> Map.put_new(:body, "")
+          |> Map.put(:body, Map.get(state.body || %{}, :body, ""))
         parse_http_response(%{state | buffer: rest, phase: :body, body: body_map})
 
       [_] ->
@@ -1235,33 +1336,61 @@ defmodule Req do
   end
 
   defp parse_status_code(<<"HTTP/1.", _::binary>> = line) do
-    case String.split(line, " ", parts: 2) do
-      [_, rest] ->
-        case Integer.parse(rest) do
-          {code, _} -> code
-          :error -> 0
-        end
-      _ -> 0
+    case :binary.split(line, " ") do
+      [_version, code | _] ->
+        parse_digits(code, 0) || 0
+
+      _ ->
+        0
     end
   end
 
   defp parse_headers(headers_str) do
     headers_str
-    |> String.split("\r\n", trim: true)
-    |> Enum.reduce(Req.Fields.new([]), fn line, acc ->
+    |> split_lines(<<"\r\n">>)
+    |> Enum.reduce(%{}, fn line, acc ->
       case :binary.split(line, ": ") do
-        [name, value] -> Req.Fields.merge(acc, %{String.downcase(name) => [String.trim(value)]})
-        _ -> acc
+        [name, value] ->
+          Map.put(acc, ascii_downcase(name), [trim_ascii(value)])
+
+        _ ->
+          acc
       end
     end)
   end
 
+  defp split_lines(bin, sep) do
+    split_lines(bin, sep, [])
+  end
+
+  defp split_lines(<<>>, _sep, acc), do: Enum.reverse(acc)
+
+  defp split_lines(bin, sep, acc) do
+    case :binary.split(bin, sep) do
+      [line, rest] -> split_lines(rest, sep, [line | acc])
+      [line] -> Enum.reverse([line | acc])
+    end
+  end
+
   defp get_content_length(nil), do: nil
 
+  defp get_content_length(headers) when is_map(headers) do
+    case Map.get(headers, "content-length") do
+      [v | _] when is_binary(v) ->
+        parse_digits(trim_ascii(v), 0)
+
+      _ ->
+        nil
+    end
+  end
+
   defp get_content_length(headers) do
-    case Req.Fields.get_list(headers) |> Enum.find(fn {k, _} -> String.downcase(k) == "content-length" end) do
-      {_, v} when is_binary(v) -> String.to_integer(String.trim(v))
-      _ -> nil
+    case Req.Fields.get_list(headers) |> Enum.find(fn {k, _} -> ascii_downcase(k) == "content-length" end) do
+      {_, v} when is_binary(v) ->
+        parse_digits(trim_ascii(v), 0)
+
+      _ ->
+        nil
     end
   end
 
@@ -1494,7 +1623,7 @@ defmodule Req do
   """
   @spec default_options() :: keyword()
   def default_options() do
-    Application.get_env(:req, :default_options, [])
+    application_env(:req, :default_options, [])
   end
 
   @doc """
@@ -1556,5 +1685,151 @@ defmodule Req do
       headers: Keyword.get(options, :headers, []),
       body: Keyword.get(options, :body, "")
     }
+  end
+
+  defp application_env(app, key, default) do
+    case :code.is_loaded(Elixir.Application) do
+      false -> default
+      {:atom, _} -> Application.get_env(app, key, default)
+    end
+  catch
+    :error, :undef -> default
+  end
+
+  defp simple_request(method, url, options) when is_binary(url) and is_list(options) do
+    %Req.Request{
+      method: method,
+      url: parse_url(url),
+      headers: normalize_headers(Keyword.get(options, :headers, [])),
+      body: nil
+    }
+  end
+
+  defp normalize_headers(headers) do
+    Enum.reduce(headers, %{}, fn {name, value}, acc ->
+      Map.put(acc, header_name(name), [header_value(value)])
+    end)
+  end
+
+  defp header_name(name) when is_atom(name), do: Atom.to_string(name)
+  defp header_name(name) when is_binary(name), do: name
+
+  defp header_value(value) when is_binary(value), do: value
+  defp header_value(value), do: to_string(value)
+
+  defp parse_url(url) when is_binary(url) do
+    if ex_tcp_available?() do
+      URI.parse(url)
+    else
+      parse_url_manual(url)
+    end
+  end
+
+  defp parse_url_manual(url) when is_binary(url) do
+    case url do
+      <<"http://", rest::binary>> -> parse_authority(rest, "http")
+      <<"https://", rest::binary>> -> parse_authority(rest, "https")
+      rest -> parse_authority(rest, "http")
+    end
+  end
+
+  defp parse_authority(rest, scheme) do
+    case :binary.split(rest, "/") do
+      [host_port] ->
+        build_url_map(scheme, host_port, "/")
+
+      [host_port | path_parts] ->
+        build_url_map(scheme, host_port, join_path(path_parts))
+    end
+  end
+
+  defp join_path([]), do: "/"
+
+  defp join_path([part]) do
+    <<"/", part::binary>>
+  end
+
+  defp join_path([part | rest]) do
+    <<"/", part::binary, join_path(rest)::binary>>
+  end
+
+  defp build_url_map(scheme, host_port, path_query) do
+    {path, query} =
+      case :binary.split(path_query, "?") do
+        [path, query] -> {path, query}
+        [path] -> {path, nil}
+      end
+
+    {host, port} =
+      case :binary.split(host_port, ":") do
+        [host, port] -> {host, port_to_int(port)}
+        [host] -> {host, nil}
+      end
+
+    %{
+      scheme: scheme,
+      host: host,
+      port: port,
+      path: path,
+      query: query,
+      userinfo: nil,
+      fragment: nil,
+      authority: nil
+    }
+  end
+
+  defp port_to_int(port) when is_binary(port) do
+    parse_digits(port, 0)
+  end
+
+  defp parse_digits(<<c, rest::binary>>, acc) when c >= ?0 and c <= ?9 do
+    parse_digits(rest, acc * 10 + c - ?0)
+  end
+
+  defp parse_digits(_, acc) when acc > 0, do: acc
+  defp parse_digits(_, _), do: nil
+
+  defp ascii_downcase(<<>>), do: <<>>
+
+  defp ascii_downcase(<<char, rest::binary>>) when char >= ?A and char <= ?Z do
+    <<char + 32, ascii_downcase(rest)::binary>>
+  end
+
+  defp ascii_downcase(<<char, rest::binary>>) do
+    <<char, ascii_downcase(rest)::binary>>
+  end
+
+  defp ascii_upcase(<<>>), do: <<>>
+
+  defp ascii_upcase(<<char, rest::binary>>) when char >= ?a and char <= ?z do
+    <<char - 32, ascii_upcase(rest)::binary>>
+  end
+
+  defp ascii_upcase(<<char, rest::binary>>) do
+    <<char, ascii_upcase(rest)::binary>>
+  end
+
+  defp trim_ascii(value) do
+    value
+    |> trim_leading_ascii()
+    |> trim_trailing_ascii()
+  end
+
+  defp trim_leading_ascii(<<32, rest::binary>>), do: trim_leading_ascii(rest)
+  defp trim_leading_ascii(<<9, rest::binary>>), do: trim_leading_ascii(rest)
+  defp trim_leading_ascii(rest), do: rest
+
+  defp trim_trailing_ascii(value) do
+    trim_trailing_ascii(value, <<>>)
+  end
+
+  defp trim_trailing_ascii(<<>>, acc), do: acc
+
+  defp trim_trailing_ascii(<<char, rest::binary>>, acc) when char == 32 or char == 9 do
+    trim_trailing_ascii(rest, <<acc::binary, char>>)
+  end
+
+  defp trim_trailing_ascii(<<char, rest::binary>>, acc) do
+    trim_trailing_ascii(rest, <<acc::binary, char>>)
   end
 end
