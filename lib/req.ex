@@ -1113,10 +1113,17 @@ defmodule Req do
   end
 
   defp do_request(req) do
-    if ex_tcp_available?() do
+    if ex_tcp_available?() and not on_atomvm?() do
       do_request_ex_tcp(req)
     else
       do_request_gen_tcp(req)
+    end
+  end
+
+  defp on_atomvm? do
+    case :code.is_loaded(:atomvm) do
+      false -> false
+      {:module, _} -> true
     end
   end
 

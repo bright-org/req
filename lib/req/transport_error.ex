@@ -16,6 +16,12 @@ defmodule Req.TransportError do
   end
 
   def message(%__MODULE__{reason: reason}) do
-    Mint.TransportError.message(%Mint.TransportError{reason: reason})
+    case :code.is_loaded(Mint.TransportError) do
+      false ->
+        "transport error: " <> inspect(reason)
+
+      {:module, _} ->
+        Mint.TransportError.message(%Mint.TransportError{reason: reason})
+    end
   end
 end
