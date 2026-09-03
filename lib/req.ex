@@ -1116,7 +1116,7 @@ defmodule Req do
     if ex_tcp_available?() and not on_atomvm?() do
       do_request_ex_tcp(req)
     else
-      do_request_gen_tcp(req)
+      do_request_socket(req)
     end
   end
 
@@ -1193,21 +1193,16 @@ defmodule Req do
     end
   end
 
-  defp do_request_gen_tcp(req) do
+  defp do_request_socket(req) do
     host = req.url.host || "localhost"
     port = req.url.port || ExTCP.default_port(req.url.scheme)
     timeout = 30_000
 
-    with {:ok, socket} <-
-           :gen_tcp.connect(
-             :erlang.binary_to_list(host),
-             port,
-             [{:timeout, timeout}, :binary, active: false]
-           ),
-         :ok <- :gen_tcp.send(socket, build_request_packet(req)),
+    with {:ok, socket} <- socket_connect(host, port, timeout),
+         :ok <- socket_send(socket, build_request_packet(req)),
          {:ok, %{status: status, headers: headers, body: body}} <-
            recv_http_response(socket, timeout) do
-      :gen_tcp.close(socket)
+      :socket.close(socket)
       {:ok, %Req.Response{status: status, headers: headers, body: body || ""}}
     else
       {:error, reason} ->
@@ -1223,7 +1218,7 @@ defmodule Req do
         {:ok, body_map}
 
       state_after ->
-        case :gen_tcp.recv(socket, 0, timeout) do
+        case :socket.recv(socket, 0, timeout) do
           {:ok, data} ->
             recv_http_response(socket, timeout, %{state_after | buffer: state_after.buffer <> data})
 
@@ -1239,6 +1234,53 @@ defmodule Req do
           {:error, reason} ->
             {:error, reason}
         end
+    end
+  end
+
+  defp socket_connect(host, port, timeout) do
+    with {:ok, addr} <- socket_resolve(host),
+         {:ok, sock} <- :socket.open(:inet, :stream, :tcp) do
+      case socket_do_connect(sock, addr, port, timeout) do
+        :ok ->
+          {:ok, sock}
+
+        {:error, reason} ->
+          _ = :socket.close(sock)
+          {:error, reason}
+      end
+    end
+  end
+
+  defp socket_send(sock, data) do
+    socket_do_send(sock, IO.iodata_to_binary(data))
+  end
+
+  defp socket_resolve(addr) when is_tuple(addr), do: {:ok, addr}
+
+  defp socket_resolve(host) when is_binary(host) do
+    :inet.getaddr(:erlang.binary_to_list(host), :inet)
+  end
+
+  defp socket_resolve(host) do
+    :inet.getaddr(host, :inet)
+  end
+
+  defp socket_do_connect(sock, addr, port, timeout) do
+    sockaddr = %{family: :inet, addr: addr, port: port}
+
+    if function_exported?(:socket, :connect, 3) do
+      :socket.connect(sock, sockaddr, timeout)
+    else
+      :socket.connect(sock, sockaddr)
+    end
+  end
+
+  defp socket_do_send(sock, data) do
+    case :socket.send(sock, data) do
+      :ok -> :ok
+      {:ok, <<>>} -> :ok
+      {:ok, rest} -> socket_do_send(sock, rest)
+      {:error, _} = error -> error
     end
   end
 
